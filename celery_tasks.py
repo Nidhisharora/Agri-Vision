@@ -90,6 +90,90 @@ if CELERY_AVAILABLE:
                 except Exception:
                     logger.exception("Failed to persist task failure for %s", result_id)
 
+            
+            # Save results to database
+            try:
+                from app import app
+                from models import AnalysisResult, db, BatchJob
+                with app.app_context():
+                    result = AnalysisResult(
+                        batch_job_id=job_id,
+                        image_name=image_name,
+                        image_index=image_index,
+                        status="complete",
+                        disease_class=results.get("disease", {}).get("predicted_class"),
+                        disease_confidence=results.get("disease", {}).get("confidence"),
+                        health_score=results.get("disease", {}).get("health_score"),
+                        growth_class=results.get("growth", {}).get("main_class"),
+                        growth_confidence=results.get("growth", {}).get("confidence"),
+                        results_json=results,
+                    )
+                    db.session.add(result)
+                    
+                    job = BatchJob.query.get(job_id)
+                    if job:
+                        completed_count = len([r for r in job.results if r.status in ("complete", "success")])
+                        failed_count = len([r for r in job.results if r.status == "error"])
+                        if completed_count + failed_count + 1 >= job.total_images:
+                            job.status = "completed"
+                            job.completed_at = datetime.utcnow()
+                    db.session.commit()
+            except Exception as db_err:
+                logger.error(f"Error saving analysis result to database: {db_err}")
+            
+            # Update task status to complete
+            self.update_state(
+                state='SUCCESS',
+                meta={
+                    'job_id': job_id,
+                    'image_index': image_index,
+                    'status': 'complete',
+                    'results': results
+                }
+            )
+            
+            return {
+                'image_name': image_name,
+                'image_index': image_index,
+                'status': 'complete',
+                'results': results,
+                'timestamp': datetime.utcnow().isoformat()
+            }
+            
+        except Exception as e:
+            logger.error(f"Error processing image {image_name}: {e}")
+            self.update_state(
+                state='FAILURE',
+                meta={
+                    'job_id': job_id,
+                    'image_index': image_index,
+                    'status': 'error',
+                    'error': str(e)
+                }
+            )
+            try:
+                from app import app
+                from models import AnalysisResult, db, BatchJob
+                with app.app_context():
+                    result = AnalysisResult(
+                        batch_job_id=job_id,
+                        image_name=image_name,
+                        image_index=image_index,
+                        status="error",
+                        error_message=str(e),
+                    )
+                    db.session.add(result)
+                    
+                    job = BatchJob.query.get(job_id)
+                    if job:
+                        completed_count = len([r for r in job.results if r.status in ("complete", "success")])
+                        failed_count = len([r for r in job.results if r.status == "error"])
+                        if completed_count + failed_count + 1 >= job.total_images:
+                            job.status = "completed"
+                            job.completed_at = datetime.utcnow()
+                    db.session.commit()
+            except Exception as db_err:
+                logger.error(f"Error saving failure result to database: {db_err}")
             raise
 
 
